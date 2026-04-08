@@ -2,9 +2,10 @@ import { world, system, Player, Block, Container, ItemStack } from "@minecraft/s
 
 // ── Constants ──────────────────────────────────────────────────
 const HOTBAR_SIZE = 9;
-const PLAYER_SORT_INTERVAL = 40; // ticks (~2 seconds)
 const CONTAINER_CHECK_INTERVAL = 4; // ticks (~0.2 seconds)
 const INTERACT_RANGE_SQ = 49; // 7 blocks squared
+const CONTAINER_FALLBACK_FINALIZE_TICKS = 100; // sort after ~5 seconds even if close cannot be inferred
+const INVENTORY_SORT_DELAY_TICKS = 2; // small debounce for live inventory sorting
 
 // ── Track open containers per player ───────────────────────────
 interface TrackedContainer {
@@ -15,8 +16,11 @@ interface TrackedContainer {
   itemTotal: number;
   snapshot: string;
   pendingSort: boolean;
+  unchangedTicks: number;
 }
 const openContainers = new Map<string, TrackedContainer>();
+const inventorySortTokens = new Map<string, number>();
+const inventorySortInProgress = new Set<string>();
 
 function isContainerBlock(typeId: string): boolean {
   return (
@@ -56,23 +60,16 @@ world.afterEvents.playerInteractWithBlock.subscribe(({ player, block, isFirstEve
     itemTotal: state.itemTotal,
     snapshot: state.snapshot,
     pendingSort: false,
+    unchangedTicks: 0,
   });
 });
 
-// ── Periodic: auto-sort player inventory ───────────────────────
-system.runInterval(() => {
-  for (const player of world.getAllPlayers()) {
-    if (openContainers.has(player.id)) continue;
+// ── Live-sort player inventory after inventory changes ─────────
+world.afterEvents.playerInventoryItemChange.subscribe(({ player }) => {
+  queueInventorySort(player);
+});
 
-    try {
-      sortContainer(player.getComponent("inventory")!.container!, HOTBAR_SIZE);
-    } catch {
-      // player in invalid state (loading, dead, etc.)
-    }
-  }
-}, PLAYER_SORT_INTERVAL);
-
-// ── Periodic: monitor open containers for changes and close detection
+// ── Periodic: monitor open containers for insert changes and close detection
 system.runInterval(() => {
   for (const player of world.getAllPlayers()) {
     const tracked = openContainers.get(player.id);
@@ -94,9 +91,24 @@ system.runInterval(() => {
     }
 
     if (state.snapshot !== tracked.snapshot) {
+      const insertedItems = state.itemTotal > tracked.itemTotal;
       tracked.itemTotal = state.itemTotal;
       tracked.snapshot = state.snapshot;
-      tracked.pendingSort = true;
+      tracked.pendingSort = tracked.pendingSort || insertedItems;
+      tracked.unchangedTicks = 0;
+      continue;
+    }
+
+    tracked.unchangedTicks += CONTAINER_CHECK_INTERVAL;
+
+    const stoppedTargeting = !isTrackingBlockInView(player, tracked);
+    if (!tracked.pendingSort && (stoppedTargeting || tracked.unchangedTicks >= CONTAINER_FALLBACK_FINALIZE_TICKS)) {
+      stopTrackingContainer(player.id);
+      continue;
+    }
+
+    if (tracked.pendingSort && (stoppedTargeting || tracked.unchangedTicks >= CONTAINER_FALLBACK_FINALIZE_TICKS)) {
+      finalizeContainer(player.id);
     }
   }
 }, CONTAINER_CHECK_INTERVAL);
@@ -105,6 +117,10 @@ system.runInterval(() => {
 world.afterEvents.playerLeave.subscribe(({ playerId }) => {
   finalizeContainer(playerId);
 });
+
+function stopTrackingContainer(playerId: string): void {
+  openContainers.delete(playerId);
+}
 
 // ── Finalize a tracked container and sort once after interaction
 function finalizeContainer(playerId: string): void {
@@ -118,6 +134,47 @@ function finalizeContainer(playerId: string): void {
   if (!state) return;
 
   sortContainer(state.container, 0);
+}
+
+function queueInventorySort(player: Player): void {
+  if (openContainers.has(player.id)) return;
+  if (inventorySortInProgress.has(player.id)) return;
+
+  const token = (inventorySortTokens.get(player.id) ?? 0) + 1;
+  inventorySortTokens.set(player.id, token);
+
+  system.runTimeout(() => {
+    if (inventorySortTokens.get(player.id) !== token) return;
+    if (openContainers.has(player.id)) return;
+
+    try {
+      inventorySortInProgress.add(player.id);
+      sortContainer(player.getComponent("inventory")!.container!, HOTBAR_SIZE);
+    } catch {
+      // player may be invalid during respawn, dimension changes, or logout
+    } finally {
+      inventorySortInProgress.delete(player.id);
+    }
+  }, INVENTORY_SORT_DELAY_TICKS);
+}
+
+function isTrackingBlockInView(player: Player, tracked: TrackedContainer): boolean {
+  try {
+    const hit = player.getBlockFromViewDirection({
+      maxDistance: Math.sqrt(INTERACT_RANGE_SQ),
+      includeLiquidBlocks: false,
+      includePassableBlocks: true,
+    });
+
+    const block = hit?.block;
+    return !!block &&
+      block.dimension.id === tracked.dimensionId &&
+      block.location.x === tracked.x &&
+      block.location.y === tracked.y &&
+      block.location.z === tracked.z;
+  } catch {
+    return false;
+  }
 }
 
 // ── Sort helpers ───────────────────────────────────────────────
