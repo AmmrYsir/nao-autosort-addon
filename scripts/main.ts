@@ -4,6 +4,7 @@ import { world, system, Player, Block, Container, ItemStack } from "@minecraft/s
 const HOTBAR_SIZE = 9;
 const PLAYER_SORT_INTERVAL = 40; // ticks (~2 seconds)
 const CONTAINER_CHECK_INTERVAL = 4; // ticks (~0.2 seconds)
+const CONTAINER_IDLE_DELAY_TICKS = 20; // wait ~1 second after the last change before sorting
 const INTERACT_RANGE_SQ = 49; // 7 blocks squared
 
 // ── Track open containers per player ───────────────────────────
@@ -14,6 +15,8 @@ interface TrackedContainer {
   dimensionId: string;
   itemTotal: number;
   snapshot: string;
+  pendingSort: boolean;
+  idleTicks: number;
 }
 const openContainers = new Map<string, TrackedContainer>();
 
@@ -54,6 +57,8 @@ world.afterEvents.playerInteractWithBlock.subscribe(({ player, block, isFirstEve
     dimensionId: block.dimension.id,
     itemTotal: state.itemTotal,
     snapshot: state.snapshot,
+    pendingSort: false,
+    idleTicks: 0,
   });
 });
 
@@ -91,18 +96,27 @@ system.runInterval(() => {
       continue;
     }
 
-    if (state.snapshot === tracked.snapshot) continue;
-
-    if (state.itemTotal > tracked.itemTotal) {
-      sortContainer(state.container, 0);
-      const sortedState = getContainerState(state.container);
-      tracked.itemTotal = sortedState.itemTotal;
-      tracked.snapshot = sortedState.snapshot;
+    if (state.snapshot !== tracked.snapshot) {
+      tracked.itemTotal = state.itemTotal;
+      tracked.snapshot = state.snapshot;
+      tracked.pendingSort = true;
+      tracked.idleTicks = 0;
       continue;
     }
 
-    tracked.itemTotal = state.itemTotal;
-    tracked.snapshot = state.snapshot;
+    if (!tracked.pendingSort) {
+      continue;
+    }
+
+    tracked.idleTicks += CONTAINER_CHECK_INTERVAL;
+    if (tracked.idleTicks < CONTAINER_IDLE_DELAY_TICKS) continue;
+
+    sortContainer(state.container, 0);
+    const sortedState = getContainerState(state.container);
+    tracked.itemTotal = sortedState.itemTotal;
+    tracked.snapshot = sortedState.snapshot;
+    tracked.pendingSort = false;
+    tracked.idleTicks = 0;
   }
 }, CONTAINER_CHECK_INTERVAL);
 
