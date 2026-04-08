@@ -1,6 +1,5 @@
 {
 	"compilerOptions": {
-		"ignoreDeprecations": "6.0",
 		"target": "es6",
 		"moduleResolution": "Node",
 		"module": "ES2020",

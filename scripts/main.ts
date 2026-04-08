@@ -2,7 +2,8 @@ import { world, system, Player, Block, Container, ItemStack } from "@minecraft/s
 
 // ── Constants ──────────────────────────────────────────────────
 const HOTBAR_SIZE = 9;
-const SORT_INTERVAL = 40; // ticks (~2 seconds)
+const PLAYER_SORT_INTERVAL = 40; // ticks (~2 seconds)
+const CONTAINER_CHECK_INTERVAL = 4; // ticks (~0.2 seconds)
 const INTERACT_RANGE_SQ = 49; // 7 blocks squared
 
 // ── Track open containers per player ───────────────────────────
@@ -11,6 +12,8 @@ interface TrackedContainer {
   y: number;
   z: number;
   dimensionId: string;
+  itemTotal: number;
+  snapshot: string;
 }
 const openContainers = new Map<string, TrackedContainer>();
 
@@ -28,9 +31,11 @@ world.afterEvents.playerInteractWithBlock.subscribe(({ player, block, isFirstEve
   if (!isFirstEvent) return;
   if (!isContainerBlock(block.typeId)) return;
 
+  const state = getBlockContainerState(block);
+  if (!state) return;
+
   const prev = openContainers.get(player.id);
 
-  // Same container reopened — skip sort, just keep tracking
   const sameBlock =
     prev &&
     prev.dimensionId === block.dimension.id &&
@@ -39,8 +44,7 @@ world.afterEvents.playerInteractWithBlock.subscribe(({ player, block, isFirstEve
     prev.z === block.location.z;
 
   if (!sameBlock) {
-    // Different container — finalize (sort) the old one
-    finalizeContainer(player.id);
+    stopTrackingContainer(player.id);
   }
 
   openContainers.set(player.id, {
@@ -48,58 +52,112 @@ world.afterEvents.playerInteractWithBlock.subscribe(({ player, block, isFirstEve
     y: block.location.y,
     z: block.location.z,
     dimensionId: block.dimension.id,
+    itemTotal: state.itemTotal,
+    snapshot: state.snapshot,
   });
 });
 
-// ── Periodic: auto-sort player inventory + detect container close
+// ── Periodic: auto-sort player inventory ───────────────────────
+system.runInterval(() => {
+  for (const player of world.getAllPlayers()) {
+    if (openContainers.has(player.id)) continue;
+
+    try {
+      sortContainer(player.getComponent("inventory")!.container!, HOTBAR_SIZE);
+    } catch {
+      // player in invalid state (loading, dead, etc.)
+    }
+  }
+}, PLAYER_SORT_INTERVAL);
+
+// ── Periodic: monitor open containers for insert-triggered sort ─
 system.runInterval(() => {
   for (const player of world.getAllPlayers()) {
     const tracked = openContainers.get(player.id);
-
-    // Only sort player inventory when no container is open
-    if (!tracked) {
-      try {
-        sortContainer(player.getComponent("inventory")!.container!, HOTBAR_SIZE);
-      } catch {
-        // player in invalid state (loading, dead, etc.)
-      }
-      continue;
-    }
-
-    // Detect container close: player walked away
+    if (!tracked) continue;
 
     const far =
       player.dimension.id !== tracked.dimensionId ||
       distanceSq(player.location, tracked) > INTERACT_RANGE_SQ;
 
-    if (far) finalizeContainer(player.id);
+    if (far) {
+      stopTrackingContainer(player.id);
+      continue;
+    }
+
+    const state = getTrackedContainerState(tracked);
+    if (!state) {
+      stopTrackingContainer(player.id);
+      continue;
+    }
+
+    if (state.snapshot === tracked.snapshot) continue;
+
+    if (state.itemTotal > tracked.itemTotal) {
+      sortContainer(state.container, 0);
+      const sortedState = getContainerState(state.container);
+      tracked.itemTotal = sortedState.itemTotal;
+      tracked.snapshot = sortedState.snapshot;
+      continue;
+    }
+
+    tracked.itemTotal = state.itemTotal;
+    tracked.snapshot = state.snapshot;
   }
-}, SORT_INTERVAL);
+}, CONTAINER_CHECK_INTERVAL);
 
 // ── Cleanup on leave ───────────────────────────────────────────
 world.afterEvents.playerLeave.subscribe(({ playerId }) => {
-  finalizeContainer(playerId);
+  stopTrackingContainer(playerId);
 });
 
-// ── Finalize (sort on close) a tracked container ───────────────
-function finalizeContainer(playerId: string): void {
-  const tracked = openContainers.get(playerId);
-  if (!tracked) return;
+// ── Stop tracking a container without sorting it ───────────────
+function stopTrackingContainer(playerId: string): void {
   openContainers.delete(playerId);
-
-  try {
-    const dim = world.getDimension(tracked.dimensionId);
-    const block = dim.getBlock(tracked);
-    if (block) sortBlockContainer(block);
-  } catch {
-    // chunk unloaded or block gone
-  }
 }
 
 // ── Sort helpers ───────────────────────────────────────────────
-function sortBlockContainer(block: Block): void {
+function getBlockContainer(block: Block): Container | undefined {
   const inv = block.getComponent("inventory");
-  if (inv?.container) sortContainer(inv.container, 0);
+  return inv?.container;
+}
+
+function getBlockContainerState(block: Block): { container: Container; itemTotal: number; snapshot: string } | undefined {
+  const container = getBlockContainer(block);
+  if (!container) return undefined;
+  return { container, ...getContainerState(container) };
+}
+
+function getTrackedContainerState(tracked: TrackedContainer): { container: Container; itemTotal: number; snapshot: string } | undefined {
+  try {
+    const dim = world.getDimension(tracked.dimensionId);
+    const block = dim.getBlock(tracked);
+    if (!block) return undefined;
+    return getBlockContainerState(block);
+  } catch {
+    return undefined;
+  }
+}
+
+function getContainerState(container: Container): { itemTotal: number; snapshot: string } {
+  let itemTotal = 0;
+  const snapshot: string[] = [];
+
+  for (let i = 0; i < container.size; i++) {
+    const item = container.getItem(i);
+    if (!item) {
+      snapshot.push("_");
+      continue;
+    }
+
+    itemTotal += item.amount;
+    snapshot.push(`${item.typeId}:${item.amount}:${item.nameTag ?? ""}`);
+  }
+
+  return {
+    itemTotal,
+    snapshot: snapshot.join("|"),
+  };
 }
 
 function sortContainer(container: Container, startSlot: number): void {
