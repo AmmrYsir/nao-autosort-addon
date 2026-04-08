@@ -1,0 +1,40 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "Smart Sort Add-On Resources",
+    "description": "Resource pack for the Smart Sort Add-On.",
+    "uuid": "f8f0c8b7-ec87-4e2f-8dd9-8d490ce224df",
+    "version": [
+      1,
+      0,
+      0
+    ],
+    "min_engine_version": [
+      1,
+      26,
+      10
+    ]
+  },
+  "modules": [
+    {
+      "description": "Smart Sort Add-On resources",
+      "type": "resources",
+      "uuid": "a436f997-c5b0-4703-96b0-f0a4ed32039c",
+      "version": [
+        1,
+        0,
+        0
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "uuid": "76db6b46-d222-42fb-844b-a54fee48bf02",
+      "version": [
+        1,
+        0,
+        0
+      ]
+    }
+  ]
+}

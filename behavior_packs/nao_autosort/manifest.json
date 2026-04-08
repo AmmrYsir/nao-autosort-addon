@@ -1,0 +1,42 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "Smart Sort Add-On",
+    "description": "Automatically sorts and stacks player inventories, chests, barrels, and shulker boxes.",
+    "uuid": "76db6b46-d222-42fb-844b-a54fee48bf02",
+    "version": [
+      1,
+      0,
+      0
+    ],
+    "min_engine_version": [
+      1,
+      26,
+      10
+    ]
+  },
+  "modules": [
+    {
+      "description": "Smart Sort Add-On scripts",
+      "language": "javascript",
+      "type": "script",
+      "uuid": "6a7a326a-a77e-4f09-8c94-c4eb17edf6c3",
+      "version": [
+        1,
+        0,
+        0
+      ],
+      "entry": "scripts/main.js"
+    }
+  ],
+  "dependencies": [
+    {
+      "module_name": "@minecraft/server",
+      "version": [
+        2,
+        6,
+        0
+      ]
+    }
+  ]
+}
