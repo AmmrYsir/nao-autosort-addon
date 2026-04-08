@@ -4,7 +4,6 @@ import { world, system, Player, Block, Container, ItemStack } from "@minecraft/s
 const HOTBAR_SIZE = 9;
 const PLAYER_SORT_INTERVAL = 40; // ticks (~2 seconds)
 const CONTAINER_CHECK_INTERVAL = 4; // ticks (~0.2 seconds)
-const CONTAINER_IDLE_DELAY_TICKS = 20; // wait ~1 second after the last change before sorting
 const INTERACT_RANGE_SQ = 49; // 7 blocks squared
 
 // ── Track open containers per player ───────────────────────────
@@ -16,7 +15,6 @@ interface TrackedContainer {
   itemTotal: number;
   snapshot: string;
   pendingSort: boolean;
-  idleTicks: number;
 }
 const openContainers = new Map<string, TrackedContainer>();
 
@@ -47,7 +45,7 @@ world.afterEvents.playerInteractWithBlock.subscribe(({ player, block, isFirstEve
     prev.z === block.location.z;
 
   if (!sameBlock) {
-    stopTrackingContainer(player.id);
+    finalizeContainer(player.id);
   }
 
   openContainers.set(player.id, {
@@ -58,7 +56,6 @@ world.afterEvents.playerInteractWithBlock.subscribe(({ player, block, isFirstEve
     itemTotal: state.itemTotal,
     snapshot: state.snapshot,
     pendingSort: false,
-    idleTicks: 0,
   });
 });
 
@@ -75,7 +72,7 @@ system.runInterval(() => {
   }
 }, PLAYER_SORT_INTERVAL);
 
-// ── Periodic: monitor open containers for insert-triggered sort ─
+// ── Periodic: monitor open containers for changes and close detection
 system.runInterval(() => {
   for (const player of world.getAllPlayers()) {
     const tracked = openContainers.get(player.id);
@@ -86,13 +83,13 @@ system.runInterval(() => {
       distanceSq(player.location, tracked) > INTERACT_RANGE_SQ;
 
     if (far) {
-      stopTrackingContainer(player.id);
+      finalizeContainer(player.id);
       continue;
     }
 
     const state = getTrackedContainerState(tracked);
     if (!state) {
-      stopTrackingContainer(player.id);
+      finalizeContainer(player.id);
       continue;
     }
 
@@ -100,34 +97,27 @@ system.runInterval(() => {
       tracked.itemTotal = state.itemTotal;
       tracked.snapshot = state.snapshot;
       tracked.pendingSort = true;
-      tracked.idleTicks = 0;
-      continue;
     }
-
-    if (!tracked.pendingSort) {
-      continue;
-    }
-
-    tracked.idleTicks += CONTAINER_CHECK_INTERVAL;
-    if (tracked.idleTicks < CONTAINER_IDLE_DELAY_TICKS) continue;
-
-    sortContainer(state.container, 0);
-    const sortedState = getContainerState(state.container);
-    tracked.itemTotal = sortedState.itemTotal;
-    tracked.snapshot = sortedState.snapshot;
-    tracked.pendingSort = false;
-    tracked.idleTicks = 0;
   }
 }, CONTAINER_CHECK_INTERVAL);
 
 // ── Cleanup on leave ───────────────────────────────────────────
 world.afterEvents.playerLeave.subscribe(({ playerId }) => {
-  stopTrackingContainer(playerId);
+  finalizeContainer(playerId);
 });
 
-// ── Stop tracking a container without sorting it ───────────────
-function stopTrackingContainer(playerId: string): void {
+// ── Finalize a tracked container and sort once after interaction
+function finalizeContainer(playerId: string): void {
+  const tracked = openContainers.get(playerId);
+  if (!tracked) return;
+
   openContainers.delete(playerId);
+  if (!tracked.pendingSort) return;
+
+  const state = getTrackedContainerState(tracked);
+  if (!state) return;
+
+  sortContainer(state.container, 0);
 }
 
 // ── Sort helpers ───────────────────────────────────────────────
