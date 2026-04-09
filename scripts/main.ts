@@ -6,7 +6,7 @@ const CONTAINER_CHECK_INTERVAL = 4; // ticks (~0.2 seconds)
 const INTERACT_RANGE_SQ = 49; // 7 blocks squared
 const CONTAINER_FALLBACK_FINALIZE_TICKS = 100; // sort after ~5 seconds even if close cannot be inferred
 const INVENTORY_SORT_DELAY_TICKS = 2; // small debounce for live inventory sorting
-const STORAGE_SORT_DELAY_TICKS = 6; // experimental live storage sort debounce
+const STORAGE_SORT_STABLE_TICKS = 20; // sort only after 1 second of no changes
 
 // ── Track open containers per player ───────────────────────────
 interface TrackedContainer {
@@ -16,6 +16,7 @@ interface TrackedContainer {
   itemTotal: number;
   snapshot: string;
   unchangedTicks: number;
+  dirty: boolean;
 }
 
 interface TrackedBlock {
@@ -40,7 +41,6 @@ interface ContainerTarget {
 const openContainers = new Map<string, TrackedContainer>();
 const inventorySortTokens = new Map<string, number>();
 const inventorySortInProgress = new Set<string>();
-const storageSortTokens = new Map<string, number>();
 const storageSortInProgress = new Set<string>();
 
 function isContainerBlock(typeId: string): boolean {
@@ -57,11 +57,27 @@ world.afterEvents.playerInteractWithBlock.subscribe(({ player, block, isFirstEve
   if (!isFirstEvent) return;
   if (!isContainerBlock(block.typeId)) return;
 
+  startTrackingContainer(player, block, 0);
+});
+
+function startTrackingContainer(player: Player, block: Block, attempt: number): void {
   const state = getBlockContainerState(block);
-  if (!state) return;
+  if (!state) {
+    // Retry for blocks that need time to open (e.g., shulker boxes)
+    if (attempt < 3) {
+      const loc = toTrackedBlock(block.location);
+      const dimId = block.dimension.id;
+      system.runTimeout(() => {
+        try {
+          const b = world.getDimension(dimId).getBlock(loc);
+          if (b && isContainerBlock(b.typeId)) startTrackingContainer(player, b, attempt + 1);
+        } catch { /* player or block may be invalid */ }
+      }, 5);
+    }
+    return;
+  }
 
   const prev = openContainers.get(player.id);
-
   const sameBlock =
     prev &&
     prev.dimensionId === block.dimension.id &&
@@ -76,8 +92,9 @@ world.afterEvents.playerInteractWithBlock.subscribe(({ player, block, isFirstEve
     itemTotal: state.itemTotal,
     snapshot: state.snapshot,
     unchangedTicks: 0,
+    dirty: false,
   });
-});
+}
 
 // ── Live-sort player inventory after inventory changes ─────────
 world.afterEvents.playerInventoryItemChange.subscribe(({ player }) => {
@@ -109,15 +126,35 @@ system.runInterval(() => {
       tracked.itemTotal = state.itemTotal;
       tracked.snapshot = state.snapshot;
       tracked.unchangedTicks = 0;
-      queueStorageSort(player.id);
+      tracked.dirty = true;
       continue;
     }
 
     tracked.unchangedTicks += CONTAINER_CHECK_INTERVAL;
 
-    const stoppedTargeting = !isTrackingBlockInView(player, tracked);
-    if (stoppedTargeting || tracked.unchangedTicks >= CONTAINER_FALLBACK_FINALIZE_TICKS) {
-      stopTrackingContainer(player.id);
+    // Sort only after container has been stable (no changes) for a while
+    if (tracked.dirty && tracked.unchangedTicks >= STORAGE_SORT_STABLE_TICKS && !storageSortInProgress.has(player.id)) {
+      tracked.dirty = false;
+      try {
+        storageSortInProgress.add(player.id);
+        sortContainerTargets(state.targets);
+        const sortedState = getTrackedContainerState(tracked);
+        if (sortedState) {
+          tracked.itemTotal = sortedState.itemTotal;
+          tracked.snapshot = sortedState.snapshot;
+        }
+      } catch { /* ignore */ } finally {
+        storageSortInProgress.delete(player.id);
+      }
+      tracked.unchangedTicks = 0;
+      continue;
+    }
+
+    if (!tracked.dirty) {
+      const stoppedTargeting = !isTrackingBlockInView(player, tracked);
+      if (stoppedTargeting || tracked.unchangedTicks >= CONTAINER_FALLBACK_FINALIZE_TICKS) {
+        stopTrackingContainer(player.id);
+      }
     }
   }
 }, CONTAINER_CHECK_INTERVAL);
@@ -129,7 +166,6 @@ world.afterEvents.playerLeave.subscribe(({ playerId }) => {
 
 function stopTrackingContainer(playerId: string): void {
   openContainers.delete(playerId);
-  storageSortTokens.delete(playerId);
   storageSortInProgress.delete(playerId);
 }
 
@@ -155,43 +191,7 @@ function queueInventorySort(player: Player): void {
   }, INVENTORY_SORT_DELAY_TICKS);
 }
 
-function queueStorageSort(playerId: string): void {
-  if (storageSortInProgress.has(playerId)) return;
 
-  const token = (storageSortTokens.get(playerId) ?? 0) + 1;
-  storageSortTokens.set(playerId, token);
-
-  system.runTimeout(() => {
-    if (storageSortTokens.get(playerId) !== token) return;
-
-    const tracked = openContainers.get(playerId);
-    if (!tracked) return;
-
-    const state = getTrackedContainerState(tracked);
-    if (!state) {
-      stopTrackingContainer(playerId);
-      return;
-    }
-
-    try {
-      storageSortInProgress.add(playerId);
-      sortContainerTargets(state.targets);
-      const sortedState = getTrackedContainerState(tracked);
-      if (!sortedState) {
-        stopTrackingContainer(playerId);
-        return;
-      }
-
-      tracked.itemTotal = sortedState.itemTotal;
-      tracked.snapshot = sortedState.snapshot;
-      tracked.unchangedTicks = 0;
-    } catch {
-      // live storage sorting is experimental and may race invalid block/container state
-    } finally {
-      storageSortInProgress.delete(playerId);
-    }
-  }, STORAGE_SORT_DELAY_TICKS);
-}
 
 function isTrackingBlockInView(player: Player, tracked: TrackedContainer): boolean {
   try {
@@ -241,20 +241,8 @@ function resolveContainerTargets(block: Block): ContainerTarget[] | undefined {
   const primary = getBlockContainer(block);
   if (!primary) return undefined;
 
-  const pair = getPairedChestBlock(block);
-  if (!pair) {
-    return [{ block, container: primary }];
-  }
-
-  const secondary = getBlockContainer(pair);
-  if (!secondary) {
-    return [{ block, container: primary }];
-  }
-
-  return [
-    { block, container: primary },
-    { block: pair, container: secondary },
-  ].sort(compareContainerTargets);
+  // Double chests disabled — each chest half sorts independently
+  return [{ block, container: primary }];
 }
 
 function getPairedChestBlock(block: Block): Block | undefined {
