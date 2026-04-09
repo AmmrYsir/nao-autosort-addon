@@ -6,22 +6,42 @@ const CONTAINER_CHECK_INTERVAL = 4; // ticks (~0.2 seconds)
 const INTERACT_RANGE_SQ = 49; // 7 blocks squared
 const CONTAINER_FALLBACK_FINALIZE_TICKS = 100; // sort after ~5 seconds even if close cannot be inferred
 const INVENTORY_SORT_DELAY_TICKS = 2; // small debounce for live inventory sorting
+const STORAGE_SORT_DELAY_TICKS = 6; // experimental live storage sort debounce
 
 // ── Track open containers per player ───────────────────────────
 interface TrackedContainer {
-  x: number;
-  y: number;
-  z: number;
+  blocks: TrackedBlock[];
+  groupKey: string;
   dimensionId: string;
   itemTotal: number;
   snapshot: string;
-  pendingSort: boolean;
   unchangedTicks: number;
+}
+
+interface TrackedBlock {
+  x: number;
+  y: number;
+  z: number;
+}
+
+interface ResolvedContainerGroup {
+  blocks: TrackedBlock[];
+  groupKey: string;
+  targets: ContainerTarget[];
+  itemTotal: number;
+  snapshot: string;
+}
+
+interface ContainerTarget {
+  block: Block;
+  container: Container;
 }
 
 const openContainers = new Map<string, TrackedContainer>();
 const inventorySortTokens = new Map<string, number>();
 const inventorySortInProgress = new Set<string>();
+const storageSortTokens = new Map<string, number>();
+const storageSortInProgress = new Set<string>();
 
 function isContainerBlock(typeId: string): boolean {
   return (
@@ -36,7 +56,6 @@ function isContainerBlock(typeId: string): boolean {
 world.afterEvents.playerInteractWithBlock.subscribe(({ player, block, isFirstEvent }) => {
   if (!isFirstEvent) return;
   if (!isContainerBlock(block.typeId)) return;
-  if (isUnsupportedDoubleChest(block)) return;
 
   const state = getBlockContainerState(block);
   if (!state) return;
@@ -46,22 +65,16 @@ world.afterEvents.playerInteractWithBlock.subscribe(({ player, block, isFirstEve
   const sameBlock =
     prev &&
     prev.dimensionId === block.dimension.id &&
-    prev.x === block.location.x &&
-    prev.y === block.location.y &&
-    prev.z === block.location.z;
+    prev.groupKey === state.groupKey;
 
-  if (!sameBlock) {
-    finalizeContainer(player.id);
-  }
+  if (!sameBlock) stopTrackingContainer(player.id);
 
   openContainers.set(player.id, {
-    x: block.location.x,
-    y: block.location.y,
-    z: block.location.z,
+    blocks: state.blocks,
+    groupKey: state.groupKey,
     dimensionId: block.dimension.id,
     itemTotal: state.itemTotal,
     snapshot: state.snapshot,
-    pendingSort: false,
     unchangedTicks: 0,
   });
 });
@@ -79,63 +92,45 @@ system.runInterval(() => {
 
     const far =
       player.dimension.id !== tracked.dimensionId ||
-      distanceSq(player.location, tracked) > INTERACT_RANGE_SQ;
+      distanceSqToTrackedBlocks(player.location, tracked.blocks) > INTERACT_RANGE_SQ;
 
     if (far) {
-      finalizeContainer(player.id);
+      stopTrackingContainer(player.id);
       continue;
     }
 
     const state = getTrackedContainerState(tracked);
     if (!state) {
-      finalizeContainer(player.id);
+      stopTrackingContainer(player.id);
       continue;
     }
 
     if (state.snapshot !== tracked.snapshot) {
-      const insertedItems = state.itemTotal > tracked.itemTotal;
       tracked.itemTotal = state.itemTotal;
       tracked.snapshot = state.snapshot;
-      tracked.pendingSort = tracked.pendingSort || insertedItems;
       tracked.unchangedTicks = 0;
+      queueStorageSort(player.id);
       continue;
     }
 
     tracked.unchangedTicks += CONTAINER_CHECK_INTERVAL;
 
     const stoppedTargeting = !isTrackingBlockInView(player, tracked);
-    if (!tracked.pendingSort && (stoppedTargeting || tracked.unchangedTicks >= CONTAINER_FALLBACK_FINALIZE_TICKS)) {
+    if (stoppedTargeting || tracked.unchangedTicks >= CONTAINER_FALLBACK_FINALIZE_TICKS) {
       stopTrackingContainer(player.id);
-      continue;
-    }
-
-    if (tracked.pendingSort && (stoppedTargeting || tracked.unchangedTicks >= CONTAINER_FALLBACK_FINALIZE_TICKS)) {
-      finalizeContainer(player.id);
     }
   }
 }, CONTAINER_CHECK_INTERVAL);
 
 // ── Cleanup on leave ───────────────────────────────────────────
 world.afterEvents.playerLeave.subscribe(({ playerId }) => {
-  finalizeContainer(playerId);
+  stopTrackingContainer(playerId);
 });
 
 function stopTrackingContainer(playerId: string): void {
   openContainers.delete(playerId);
-}
-
-// ── Finalize a tracked container and sort once after interaction
-function finalizeContainer(playerId: string): void {
-  const tracked = openContainers.get(playerId);
-  if (!tracked) return;
-
-  openContainers.delete(playerId);
-  if (!tracked.pendingSort) return;
-
-  const state = getTrackedContainerState(tracked);
-  if (!state) return;
-
-  sortContainer(state.container, 0);
+  storageSortTokens.delete(playerId);
+  storageSortInProgress.delete(playerId);
 }
 
 function queueInventorySort(player: Player): void {
@@ -160,6 +155,44 @@ function queueInventorySort(player: Player): void {
   }, INVENTORY_SORT_DELAY_TICKS);
 }
 
+function queueStorageSort(playerId: string): void {
+  if (storageSortInProgress.has(playerId)) return;
+
+  const token = (storageSortTokens.get(playerId) ?? 0) + 1;
+  storageSortTokens.set(playerId, token);
+
+  system.runTimeout(() => {
+    if (storageSortTokens.get(playerId) !== token) return;
+
+    const tracked = openContainers.get(playerId);
+    if (!tracked) return;
+
+    const state = getTrackedContainerState(tracked);
+    if (!state) {
+      stopTrackingContainer(playerId);
+      return;
+    }
+
+    try {
+      storageSortInProgress.add(playerId);
+      sortContainerTargets(state.targets);
+      const sortedState = getTrackedContainerState(tracked);
+      if (!sortedState) {
+        stopTrackingContainer(playerId);
+        return;
+      }
+
+      tracked.itemTotal = sortedState.itemTotal;
+      tracked.snapshot = sortedState.snapshot;
+      tracked.unchangedTicks = 0;
+    } catch {
+      // live storage sorting is experimental and may race invalid block/container state
+    } finally {
+      storageSortInProgress.delete(playerId);
+    }
+  }, STORAGE_SORT_DELAY_TICKS);
+}
+
 function isTrackingBlockInView(player: Player, tracked: TrackedContainer): boolean {
   try {
     const hit = player.getBlockFromViewDirection({
@@ -169,11 +202,7 @@ function isTrackingBlockInView(player: Player, tracked: TrackedContainer): boole
     });
 
     const block = hit?.block;
-    return !!block &&
-      block.dimension.id === tracked.dimensionId &&
-      block.location.x === tracked.x &&
-      block.location.y === tracked.y &&
-      block.location.z === tracked.z;
+    return !!block && block.dimension.id === tracked.dimensionId && hasTrackedBlock(tracked.blocks, block.location);
   } catch {
     return false;
   }
@@ -185,21 +214,47 @@ function getBlockContainer(block: Block): Container | undefined {
   return inv?.container;
 }
 
-function getBlockContainerState(block: Block): { container: Container; itemTotal: number; snapshot: string } | undefined {
-  const container = getBlockContainer(block);
-  if (!container) return undefined;
-  return { container, ...getContainerState(container) };
+function getBlockContainerState(block: Block): ResolvedContainerGroup | undefined {
+  const targets = resolveContainerTargets(block);
+  if (!targets) return undefined;
+
+  return {
+    targets,
+    blocks: targets.map(({ block: targetBlock }) => toTrackedBlock(targetBlock.location)),
+    groupKey: getContainerGroupKey(targets),
+    ...getContainerStateFromTargets(targets),
+  };
 }
 
-function getTrackedContainerState(tracked: TrackedContainer): { container: Container; itemTotal: number; snapshot: string } | undefined {
+function getTrackedContainerState(tracked: TrackedContainer): ResolvedContainerGroup | undefined {
   try {
     const dim = world.getDimension(tracked.dimensionId);
-    const block = dim.getBlock(tracked);
+    const block = dim.getBlock(tracked.blocks[0]);
     if (!block) return undefined;
     return getBlockContainerState(block);
   } catch {
     return undefined;
   }
+}
+
+function resolveContainerTargets(block: Block): ContainerTarget[] | undefined {
+  const primary = getBlockContainer(block);
+  if (!primary) return undefined;
+
+  const pair = getPairedChestBlock(block);
+  if (!pair) {
+    return [{ block, container: primary }];
+  }
+
+  const secondary = getBlockContainer(pair);
+  if (!secondary) {
+    return [{ block, container: primary }];
+  }
+
+  return [
+    { block, container: primary },
+    { block: pair, container: secondary },
+  ].sort(compareContainerTargets);
 }
 
 function getPairedChestBlock(block: Block): Block | undefined {
@@ -225,29 +280,87 @@ function getHorizontalNeighbors(block: Block): Array<Block | undefined> {
   return [block.north(), block.south(), block.east(), block.west()];
 }
 
-function isUnsupportedDoubleChest(block: Block): boolean {
-  return !!getPairedChestBlock(block);
+function compareContainerTargets(left: ContainerTarget, right: ContainerTarget): number {
+  return compareTrackedBlocks(left.block.location, right.block.location);
 }
 
-function getContainerState(container: Container): { itemTotal: number; snapshot: string } {
+function compareTrackedBlocks(left: TrackedBlock, right: TrackedBlock): number {
+  return left.x - right.x || left.y - right.y || left.z - right.z;
+}
+
+function toTrackedBlock(location: { x: number; y: number; z: number }): TrackedBlock {
+  return {
+    x: location.x,
+    y: location.y,
+    z: location.z,
+  };
+}
+
+function getContainerGroupKey(targets: ContainerTarget[]): string {
+  return targets
+    .map(({ block }) => `${block.location.x},${block.location.y},${block.location.z}`)
+    .join("|");
+}
+
+function getContainerStateFromTargets(targets: ContainerTarget[]): { itemTotal: number; snapshot: string } {
   let itemTotal = 0;
   const snapshot: string[] = [];
 
-  for (let i = 0; i < container.size; i++) {
-    const item = container.getItem(i);
-    if (!item) {
-      snapshot.push("_");
-      continue;
-    }
+  for (const { container } of targets) {
+    for (let i = 0; i < container.size; i++) {
+      const item = container.getItem(i);
+      if (!item) {
+        snapshot.push("_");
+        continue;
+      }
 
-    itemTotal += item.amount;
-    snapshot.push(`${item.typeId}:${item.amount}:${item.nameTag ?? ""}`);
+      itemTotal += item.amount;
+      snapshot.push(`${item.typeId}:${item.amount}:${item.nameTag ?? ""}`);
+    }
   }
 
   return {
     itemTotal,
     snapshot: snapshot.join("|"),
   };
+}
+
+function sortContainerTargets(targets: ContainerTarget[]): void {
+  const items: ItemStack[] = [];
+
+  for (const { container } of targets) {
+    for (let i = 0; i < container.size; i++) {
+      const item = container.getItem(i);
+      if (item) items.push(item.clone());
+    }
+  }
+
+  if (items.length === 0) return;
+
+  const merged = mergeStacks(items);
+  merged.sort((a, b) => a.typeId.localeCompare(b.typeId) || b.amount - a.amount);
+
+  let mergedIndex = 0;
+  for (const { container } of targets) {
+    for (let i = 0; i < container.size; i++) {
+      container.setItem(i, merged[mergedIndex] ?? undefined);
+      mergedIndex += 1;
+    }
+  }
+}
+
+function hasTrackedBlock(blocks: TrackedBlock[], location: { x: number; y: number; z: number }): boolean {
+  return blocks.some((block) => block.x === location.x && block.y === location.y && block.z === location.z);
+}
+
+function distanceSqToTrackedBlocks(location: { x: number; y: number; z: number }, blocks: TrackedBlock[]): number {
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (const block of blocks) {
+    bestDistance = Math.min(bestDistance, distanceSq(location, block));
+  }
+
+  return bestDistance;
 }
 
 function sortContainer(container: Container, startSlot: number): void {
