@@ -2,10 +2,8 @@ import { world, system, Player, Block, Container, ItemStack } from "@minecraft/s
 
 // ── Constants ──────────────────────────────────────────────────
 const HOTBAR_SIZE = 9;
-const CONTAINER_CHECK_INTERVAL = 4; // ticks (~0.2 seconds)
+const CONTAINER_CHECK_INTERVAL = 10; // ticks (~0.5 seconds)
 const INTERACT_RANGE_SQ = 49; // 7 blocks squared
-const CLOSE_DETECT_STABLE_TICKS = 10; // ticks of not looking at container before considered closed
-const MAX_TRACKING_TICKS = 200; // force close after ~10 seconds regardless of view
 const INVENTORY_SORT_DELAY_TICKS = 2; // small debounce for live inventory sorting
 
 // ── Track open containers per player ───────────────────────────
@@ -14,8 +12,6 @@ interface TrackedContainer {
   groupKey: string;
   dimensionId: string;
   snapshot: string;
-  notViewingTicks: number;
-  ageTicks: number;
 }
 
 interface TrackedBlock {
@@ -81,15 +77,20 @@ function startTrackingContainer(player: Player, block: Block, attempt: number): 
     prev.dimensionId === block.dimension.id &&
     prev.groupKey === state.groupKey;
 
-  if (!sameBlock) stopTrackingContainer(player.id);
+  if (!sameBlock) {
+    // Player opened a DIFFERENT container — sort & close the previous one first
+    const old = openContainers.get(player.id);
+    if (old) {
+      sortTrackedContainer(old);
+      openContainers.delete(player.id);
+    }
+  }
 
   openContainers.set(player.id, {
     blocks: state.blocks,
     groupKey: state.groupKey,
     dimensionId: block.dimension.id,
     snapshot: state.snapshot,
-    notViewingTicks: 0,
-    ageTicks: 0,
   });
   console.warn(`[autosort] tracking container ${state.groupKey} for ${player.name}`);
 }
@@ -99,7 +100,7 @@ world.afterEvents.playerInventoryItemChange.subscribe(({ player }) => {
   queueInventorySort(player);
 });
 
-// ── Periodic: detect container close and sort after ────────────
+// ── Periodic: only check distance for guaranteed UI close ─────
 system.runInterval(() => {
   for (const player of world.getAllPlayers()) {
     const tracked = openContainers.get(player.id);
@@ -109,26 +110,9 @@ system.runInterval(() => {
       player.dimension.id !== tracked.dimensionId ||
       distanceSqToTrackedBlocks(player.location, tracked.blocks) > INTERACT_RANGE_SQ;
 
-    tracked.ageTicks += CONTAINER_CHECK_INTERVAL;
-
-    if (far || tracked.ageTicks >= MAX_TRACKING_TICKS) {
-      console.warn(`[autosort] closing (${far ? "far" : "timeout"}) for ${player.name}`);
-      sortAndStopTracking(tracked);
-      openContainers.delete(player.id);
-      continue;
-    }
-
-    const viewing = isTrackingBlockInView(player, tracked);
-    if (viewing) {
-      tracked.notViewingTicks = 0;
-      continue;
-    }
-
-    tracked.notViewingTicks += CONTAINER_CHECK_INTERVAL;
-
-    if (tracked.notViewingTicks >= CLOSE_DETECT_STABLE_TICKS) {
-      console.warn(`[autosort] closing (look away) for ${player.name}`);
-      sortAndStopTracking(tracked);
+    if (far) {
+      console.warn(`[autosort] closing (walked away) for ${player.name}`);
+      sortTrackedContainer(tracked);
       openContainers.delete(player.id);
     }
   }
@@ -136,21 +120,20 @@ system.runInterval(() => {
 
 // ── Cleanup on leave ───────────────────────────────────────────
 world.afterEvents.playerLeave.subscribe(({ playerId }) => {
-  stopTrackingContainer(playerId);
+  const tracked = openContainers.get(playerId);
+  if (tracked) {
+    sortTrackedContainer(tracked);
+    openContainers.delete(playerId);
+  }
 });
 
-function stopTrackingContainer(playerId: string): void {
-  openContainers.delete(playerId);
-}
-
-function sortAndStopTracking(tracked: TrackedContainer): void {
+function sortTrackedContainer(tracked: TrackedContainer): void {
   try {
     const state = getTrackedContainerState(tracked);
     if (!state) {
       console.warn(`[autosort] container no longer valid, skipping sort`);
       return;
     }
-    // Only sort if contents actually changed since we started tracking
     if (state.snapshot !== tracked.snapshot) {
       sortContainerTargets(state.targets);
       console.warn(`[autosort] sorted container ${tracked.groupKey}`);
@@ -185,21 +168,6 @@ function queueInventorySort(player: Player): void {
 }
 
 
-
-function isTrackingBlockInView(player: Player, tracked: TrackedContainer): boolean {
-  try {
-    const hit = player.getBlockFromViewDirection({
-      maxDistance: Math.sqrt(INTERACT_RANGE_SQ),
-      includeLiquidBlocks: false,
-      includePassableBlocks: true,
-    });
-
-    const block = hit?.block;
-    return !!block && block.dimension.id === tracked.dimensionId && hasTrackedBlock(tracked.blocks, block.location);
-  } catch {
-    return false;
-  }
-}
 
 // ── Sort helpers ───────────────────────────────────────────────
 function getBlockContainer(block: Block): Container | undefined {
