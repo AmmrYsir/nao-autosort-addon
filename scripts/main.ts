@@ -103,8 +103,17 @@ function sortContainer(container: Container, startSlot: number): void {
   const merged = mergeStacks(items);
   merged.sort((a, b) => a.typeId.localeCompare(b.typeId) || b.amount - a.amount);
 
+  // Only write slots that actually changed
   for (let i = startSlot; i < size; i++) {
-    container.setItem(i, merged[i - startSlot] ?? undefined);
+    const sortedItem = merged[i - startSlot];
+    const currentItem = container.getItem(i);
+
+    const sortedKey = sortedItem ? `${sortedItem.typeId}:${sortedItem.amount}` : "";
+    const currentKey = currentItem ? `${currentItem.typeId}:${currentItem.amount}` : "";
+
+    if (sortedKey !== currentKey) {
+      container.setItem(i, sortedItem ?? undefined);
+    }
   }
 }
 
