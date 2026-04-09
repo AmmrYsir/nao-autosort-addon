@@ -89,30 +89,114 @@ world.afterEvents.playerLeave.subscribe(({ playerId }) => {
 });
 
 // -- Sort helpers -----------------------------------------------
+
+// Category order: lower number = higher priority (sorted first)
+const enum Category {
+  Weapon = 0,
+  Tool = 1,
+  Armor = 2,
+  Food = 3,
+  Block = 4,
+  Misc = 5,
+}
+
+const WEAPON_SUFFIXES = ["_sword", "_spear"];
+const WEAPON_EXACT = new Set(["minecraft:bow", "minecraft:crossbow", "minecraft:trident", "minecraft:mace"]);
+const TOOL_SUFFIXES = ["_pickaxe", "_axe", "_shovel", "_hoe"];
+const TOOL_EXACT = new Set([
+  "minecraft:fishing_rod", "minecraft:flint_and_steel", "minecraft:shears",
+  "minecraft:shield", "minecraft:spyglass", "minecraft:compass", "minecraft:clock",
+  "minecraft:lead", "minecraft:name_tag", "minecraft:brush",
+]);
+const ARMOR_SUFFIXES = ["_helmet", "_chestplate", "_leggings", "_boots", "_nautilus_armor"];
+const ARMOR_EXACT = new Set(["minecraft:turtle_helmet", "minecraft:elytra"]);
+const FOOD_EXACT = new Set([
+  "minecraft:apple", "minecraft:golden_apple", "minecraft:enchanted_golden_apple",
+  "minecraft:bread", "minecraft:cookie", "minecraft:cake", "minecraft:pumpkin_pie",
+  "minecraft:melon_slice", "minecraft:sweet_berries", "minecraft:glow_berries",
+  "minecraft:beef", "minecraft:porkchop", "minecraft:chicken", "minecraft:mutton",
+  "minecraft:rabbit", "minecraft:cod", "minecraft:salmon", "minecraft:tropical_fish",
+  "minecraft:rabbit_stew", "minecraft:mushroom_stew", "minecraft:beetroot_soup",
+  "minecraft:suspicious_stew", "minecraft:baked_potato", "minecraft:poisonous_potato",
+  "minecraft:dried_kelp", "minecraft:beetroot", "minecraft:carrot", "minecraft:potato",
+  "minecraft:golden_carrot", "minecraft:rotten_flesh", "minecraft:spider_eye",
+  "minecraft:chorus_fruit",
+]);
+const FOOD_PREFIXES = ["cooked_"];
+const BLOCK_SUFFIXES = [
+  "_log", "_wood", "_planks", "_slab", "_stairs", "_wall", "_fence", "_door",
+  "_trapdoor", "_bricks", "_ore", "_block", "_carpet", "_wool", "_terracotta",
+  "_concrete", "_glass", "_pane",
+];
+const BLOCK_EXACT = new Set([
+  "minecraft:cobblestone", "minecraft:stone", "minecraft:deepslate",
+  "minecraft:dirt", "minecraft:grass_block", "minecraft:sand", "minecraft:red_sand",
+  "minecraft:gravel", "minecraft:clay", "minecraft:mud", "minecraft:netherrack",
+  "minecraft:end_stone", "minecraft:obsidian", "minecraft:sandstone",
+  "minecraft:red_sandstone", "minecraft:basalt", "minecraft:blackstone",
+  "minecraft:tuff", "minecraft:calcite", "minecraft:dripstone_block",
+  "minecraft:torch", "minecraft:crafting_table", "minecraft:furnace",
+  "minecraft:chest", "minecraft:barrel",
+]);
+
+function getCategory(typeId: string): Category {
+  const name = typeId.startsWith("minecraft:") ? typeId.substring(10) : typeId;
+
+  if (WEAPON_EXACT.has(typeId)) return Category.Weapon;
+  for (const s of WEAPON_SUFFIXES) if (name.endsWith(s)) return Category.Weapon;
+
+  if (TOOL_EXACT.has(typeId)) return Category.Tool;
+  for (const s of TOOL_SUFFIXES) if (name.endsWith(s)) return Category.Tool;
+
+  if (ARMOR_EXACT.has(typeId)) return Category.Armor;
+  for (const s of ARMOR_SUFFIXES) if (name.endsWith(s)) return Category.Armor;
+
+  if (FOOD_EXACT.has(typeId)) return Category.Food;
+  for (const p of FOOD_PREFIXES) if (name.startsWith(p)) return Category.Food;
+
+  if (BLOCK_EXACT.has(typeId)) return Category.Block;
+  for (const s of BLOCK_SUFFIXES) if (name.endsWith(s)) return Category.Block;
+
+  return Category.Misc;
+}
+
+function compareItems(a: ItemStack, b: ItemStack): number {
+  const catDiff = getCategory(a.typeId) - getCategory(b.typeId);
+  if (catDiff !== 0) return catDiff;
+  return a.typeId.localeCompare(b.typeId) || b.amount - a.amount;
+}
+
+interface SlotEntry {
+  index: number;
+  item: ItemStack | undefined;
+}
+
 function sortContainer(container: Container, startSlot: number): void {
   const size = container.size;
-  const items: ItemStack[] = [];
 
+  // Read all slots — no cloning yet
+  const slots: SlotEntry[] = [];
   for (let i = startSlot; i < size; i++) {
-    const item = container.getItem(i);
-    if (item) items.push(item.clone());
+    slots.push({ index: i, item: container.getItem(i) });
   }
 
+  // Merge stacks (clones only during merge)
+  const items = slots.filter((s) => s.item != null).map((s) => s.item!);
   if (items.length === 0) return;
 
   const merged = mergeStacks(items);
-  merged.sort((a, b) => a.typeId.localeCompare(b.typeId) || b.amount - a.amount);
+  merged.sort(compareItems);
 
-  // Only write slots that actually changed
+  // Only clone and write slots that actually changed
   for (let i = startSlot; i < size; i++) {
     const sortedItem = merged[i - startSlot];
-    const currentItem = container.getItem(i);
+    const currentItem = slots[i - startSlot].item;
 
     const sortedKey = sortedItem ? `${sortedItem.typeId}:${sortedItem.amount}` : "";
     const currentKey = currentItem ? `${currentItem.typeId}:${currentItem.amount}` : "";
 
     if (sortedKey !== currentKey) {
-      container.setItem(i, sortedItem ?? undefined);
+      container.setItem(i, sortedItem?.clone() ?? undefined);
     }
   }
 }
