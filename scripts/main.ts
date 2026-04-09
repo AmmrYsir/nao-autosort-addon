@@ -4,19 +4,16 @@ import { world, system, Player, Block, Container, ItemStack } from "@minecraft/s
 const HOTBAR_SIZE = 9;
 const CONTAINER_CHECK_INTERVAL = 4; // ticks (~0.2 seconds)
 const INTERACT_RANGE_SQ = 49; // 7 blocks squared
-const CONTAINER_FALLBACK_FINALIZE_TICKS = 100; // sort after ~5 seconds even if close cannot be inferred
+const CLOSE_DETECT_STABLE_TICKS = 10; // ticks of not looking at container before considered closed
 const INVENTORY_SORT_DELAY_TICKS = 2; // small debounce for live inventory sorting
-const STORAGE_SORT_STABLE_TICKS = 20; // sort only after 1 second of no changes
 
 // ── Track open containers per player ───────────────────────────
 interface TrackedContainer {
   blocks: TrackedBlock[];
   groupKey: string;
   dimensionId: string;
-  itemTotal: number;
   snapshot: string;
-  unchangedTicks: number;
-  dirty: boolean;
+  notViewingTicks: number;
 }
 
 interface TrackedBlock {
@@ -41,7 +38,6 @@ interface ContainerTarget {
 const openContainers = new Map<string, TrackedContainer>();
 const inventorySortTokens = new Map<string, number>();
 const inventorySortInProgress = new Set<string>();
-const storageSortInProgress = new Set<string>();
 
 function isContainerBlock(typeId: string): boolean {
   return (
@@ -89,10 +85,8 @@ function startTrackingContainer(player: Player, block: Block, attempt: number): 
     blocks: state.blocks,
     groupKey: state.groupKey,
     dimensionId: block.dimension.id,
-    itemTotal: state.itemTotal,
     snapshot: state.snapshot,
-    unchangedTicks: 0,
-    dirty: false,
+    notViewingTicks: 0,
   });
 }
 
@@ -101,7 +95,7 @@ world.afterEvents.playerInventoryItemChange.subscribe(({ player }) => {
   queueInventorySort(player);
 });
 
-// ── Periodic: monitor open containers for insert changes and close detection
+// ── Periodic: detect container close and sort after ────────────
 system.runInterval(() => {
   for (const player of world.getAllPlayers()) {
     const tracked = openContainers.get(player.id);
@@ -112,49 +106,22 @@ system.runInterval(() => {
       distanceSqToTrackedBlocks(player.location, tracked.blocks) > INTERACT_RANGE_SQ;
 
     if (far) {
-      stopTrackingContainer(player.id);
+      sortAndStopTracking(tracked);
+      openContainers.delete(player.id);
       continue;
     }
 
-    const state = getTrackedContainerState(tracked);
-    if (!state) {
-      stopTrackingContainer(player.id);
+    const viewing = isTrackingBlockInView(player, tracked);
+    if (viewing) {
+      tracked.notViewingTicks = 0;
       continue;
     }
 
-    if (state.snapshot !== tracked.snapshot) {
-      tracked.itemTotal = state.itemTotal;
-      tracked.snapshot = state.snapshot;
-      tracked.unchangedTicks = 0;
-      tracked.dirty = true;
-      continue;
-    }
+    tracked.notViewingTicks += CONTAINER_CHECK_INTERVAL;
 
-    tracked.unchangedTicks += CONTAINER_CHECK_INTERVAL;
-
-    // Sort only after container has been stable (no changes) for a while
-    if (tracked.dirty && tracked.unchangedTicks >= STORAGE_SORT_STABLE_TICKS && !storageSortInProgress.has(player.id)) {
-      tracked.dirty = false;
-      try {
-        storageSortInProgress.add(player.id);
-        sortContainerTargets(state.targets);
-        const sortedState = getTrackedContainerState(tracked);
-        if (sortedState) {
-          tracked.itemTotal = sortedState.itemTotal;
-          tracked.snapshot = sortedState.snapshot;
-        }
-      } catch { /* ignore */ } finally {
-        storageSortInProgress.delete(player.id);
-      }
-      tracked.unchangedTicks = 0;
-      continue;
-    }
-
-    if (!tracked.dirty) {
-      const stoppedTargeting = !isTrackingBlockInView(player, tracked);
-      if (stoppedTargeting || tracked.unchangedTicks >= CONTAINER_FALLBACK_FINALIZE_TICKS) {
-        stopTrackingContainer(player.id);
-      }
+    if (tracked.notViewingTicks >= CLOSE_DETECT_STABLE_TICKS) {
+      sortAndStopTracking(tracked);
+      openContainers.delete(player.id);
     }
   }
 }, CONTAINER_CHECK_INTERVAL);
@@ -166,7 +133,17 @@ world.afterEvents.playerLeave.subscribe(({ playerId }) => {
 
 function stopTrackingContainer(playerId: string): void {
   openContainers.delete(playerId);
-  storageSortInProgress.delete(playerId);
+}
+
+function sortAndStopTracking(tracked: TrackedContainer): void {
+  try {
+    const state = getTrackedContainerState(tracked);
+    if (!state) return;
+    // Only sort if contents actually changed since we started tracking
+    if (state.snapshot !== tracked.snapshot) {
+      sortContainerTargets(state.targets);
+    }
+  } catch { /* block/container may have been destroyed */ }
 }
 
 function queueInventorySort(player: Player): void {
